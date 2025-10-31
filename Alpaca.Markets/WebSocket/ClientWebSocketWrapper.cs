@@ -14,8 +14,16 @@ internal sealed class ClientWebSocketWrapper : IWebSocket
     public void Dispose() => _client.Dispose();
 
     public Task ConnectAsync(
-        Uri uri, CancellationToken cancellationToken) =>
-        _client.ConnectAsync(uri, cancellationToken);
+        Uri uri, CancellationToken cancellationToken)
+    {
+        // https://learn.microsoft.com/en-us/dotnet/api/system.net.websockets.clientwebsocketoptions.keepaliveinterval?view=net-9.0
+        // https://github.com/dotnet/runtime/blob/d9c4c3e73dcf09435a3cc1cabb23584c9f24b504/src/libraries/System.Net.WebSockets/src/System/Net/WebSockets/WebSocketCreationOptions.cs#L44
+        // If <see cref="WebSocketCreationOptions.KeepAliveTimeout"/> is set, then PING messages are sent and peer's PONG responses are expected, otherwise,
+        // unsolicited PONG messages are used as a keep-alive heartbeat.
+        // The default is <see cref="TimeSpan.Zero"/>.
+        _client.Options.KeepAliveInterval = TimeSpan.FromSeconds(5);
+        return _client.ConnectAsync(uri, cancellationToken);
+    }
 
     public ValueTask SendAsync(
         ReadOnlySequence<Byte> buffer)

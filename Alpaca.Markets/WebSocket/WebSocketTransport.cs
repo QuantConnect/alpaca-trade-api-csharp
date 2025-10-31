@@ -41,6 +41,8 @@ internal sealed class WebSocketsTransport(
 
     private Task _running = Task.CompletedTask;
 
+    private CancellationTokenSource? _cancellationTokenSource;
+
     private SpinLock _sendLock = new(false);
 
     private volatile Boolean _aborted;
@@ -193,71 +195,97 @@ internal sealed class WebSocketsTransport(
         }
     }
 
-    public void Dispose() => _webSocket?.Dispose();
+    public void Dispose()
+    {
+        _cancellationTokenSource?.Cancel();
+        _cancellationTokenSource?.Dispose();
+        _webSocket?.Dispose();
+    }
 
-    private async Task processSocketAsync(
+    private Task processSocketAsync(
         IWebSocket socket,
         IDuplexPipe application,
         IDuplexPipe transport)
     {
-        using (socket)
+        _cancellationTokenSource?.Dispose();
+        _cancellationTokenSource = new();
+        var keepRunning = default(bool);
+        return Task.Factory.StartNew(async () =>
         {
-            // Begin sending and receiving.
-            var receiving = startReceiving(socket, application, transport);
-            var sending = startSending(socket, application);
-
-            // Wait for send or receive to complete
-            var trigger = await Task.WhenAny(receiving, sending)
-                .ConfigureAwait(false);
-
-            if (trigger == receiving)
+            do
             {
-                // We're waiting for the application to finish and there are 2 things it could be doing
-                // 1. Waiting for application data
-                // 2. Waiting for a websocket send to complete
-
-                // Cancel the application so that ReadAsync yields
-                application.Input.CancelPendingRead();
-
-                using var delayCts = new CancellationTokenSource();
-
-                var resultTask = await Task.WhenAny(sending,
-                        Task.Delay(Timeout.InfiniteTimeSpan, delayCts.Token))
-                    .ConfigureAwait(false);
-
-                if (resultTask != sending)
+                try
                 {
-                    _aborted = true;
+                    using (socket)
+                    {
+                        // Begin sending and receiving.
+                        var receiving = startReceiving(socket, application, transport);
+                        var sending = startSending(socket, application);
 
-                    // Abort the websocket if we're stuck in a pending send to the client
-                    socket.Abort();
-                }
-                else
-                {
-                    // Cancel the timeout
+                        // Wait for send or receive to complete
+                        var trigger = await Task.WhenAny(receiving, sending)
+                            .ConfigureAwait(false);
+
+                        if (trigger == receiving)
+                        {
+                            // We're waiting for the application to finish and there are 2 things it could be doing
+                            // 1. Waiting for application data
+                            // 2. Waiting for a websocket send to complete
+
+                            // Cancel the application so that ReadAsync yields
+                            application.Input.CancelPendingRead();
+
+                            using var delayCts = new CancellationTokenSource();
+
+                            var resultTask = await Task.WhenAny(sending,
+                                    Task.Delay(TimeSpan.FromSeconds(30), delayCts.Token))
+                                    .ConfigureAwait(false);
+
+                            if (resultTask != sending)
+                            {
+                                _aborted = true;
+                                Error?.Invoke(new TimeoutException("The operation timed out while attempting to send data to the client. " +
+                                    "The connection has been aborted to prevent hanging."));
+                                // Abort the websocket if we're stuck in a pending send to the client
+                                socket.Abort();
+                            }
+                            else
+                            {
+                                // Cancel the timeout
 #if NET8_0_OR_GREATER
-                    await delayCts.CancelAsync().ConfigureAwait(false);
+                                await delayCts.CancelAsync().ConfigureAwait(false);
 #else
-                    delayCts.Cancel();
+                                delayCts.Cancel();
 #endif
+                            }
+                        }
+                        else
+                        {
+                            // We're waiting on the websocket to close and there are 2 things it could be doing
+                            // 1. Waiting for websocket data
+                            // 2. Waiting on a flush to complete (back pressure being applied)
+                            _aborted = true;
+
+                            // Abort the websocket if we're stuck in a pending reception from the client
+                            socket.Abort();
+
+                            // Cancel any pending flush so that we can quit
+                            application.Output.CancelPendingFlush();
+                        }
+
+                        Closed?.Invoke();
+                        // Gracefully exit the loop after successful completion
+                        keepRunning = false;
+                    }
                 }
-            }
-            else
-            {
-                // We're waiting on the websocket to close and there are 2 things it could be doing
-                // 1. Waiting for websocket data
-                // 2. Waiting on a flush to complete (back pressure being applied)
-                _aborted = true;
-
-                // Abort the websocket if we're stuck in a pending reception from the client
-                socket.Abort();
-
-                // Cancel any pending flush so that we can quit
-                application.Output.CancelPendingFlush();
-            }
-
-            Closed?.Invoke();
-        }
+                catch (Exception exception)
+                {
+                    Error?.Invoke(exception);
+                    // Continue the loop after handling the error
+                    keepRunning = true;
+                }
+            } while (keepRunning && !_cancellationTokenSource.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(10)));
+        }, _cancellationTokenSource.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
     [SuppressMessage(
@@ -274,15 +302,18 @@ internal sealed class WebSocketsTransport(
         }
         catch (OperationCanceledException exception)
         {
+            Error?.Invoke(exception);
             Trace.TraceInformation(exception.Message);
         }
         catch (WebSocketException exception) when
             (exception.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
         {
+            Error?.Invoke(exception);
             Trace.TraceInformation(exception.Message);
         }
         catch (Exception exception)
         {
+            Error?.Invoke(exception);
             if (!_aborted)
             {
                 await application.Output.CompleteAsync(exception).ConfigureAwait(false);
