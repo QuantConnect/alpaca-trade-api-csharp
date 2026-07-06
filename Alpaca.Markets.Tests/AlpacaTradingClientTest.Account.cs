@@ -37,7 +37,6 @@ public sealed partial class AlpacaTradingClientTest
             new JProperty("options_buying_power", cash),
             new JProperty("short_market_value", Price),
             new JProperty("maintenance_margin", Price),
-            new JProperty("pattern_day_trader", false),
             new JProperty("regt_buying_power", Price),
             new JProperty("long_market_value", Price),
             new JProperty("transfers_blocked", false),
