@@ -202,6 +202,12 @@ internal sealed class WebSocketsTransport(
         _webSocket?.Dispose();
     }
 
+    [SuppressMessage(
+        "Design", "CA1031:Do not catch general exception types",
+        Justification = "Expected behavior - we report exceptions via Error event and keep the loop running.")]
+    [SuppressMessage(
+        "Performance", "CA1859:Use concrete types when possible for improved performance",
+        Justification = "Expected behavior - callers only wait on the returned task, so the plain Task type is enough.")]
     private Task processSocketAsync(
         IWebSocket socket,
         IDuplexPipe application,
